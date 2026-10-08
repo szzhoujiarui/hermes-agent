@@ -604,7 +604,13 @@ def test_cached_nvidia_gpu_query_hides_console_window_and_caches(monkeypatch):
 
 
 def test_cached_nvidia_gpu_query_failure_is_cached(monkeypatch):
-    """A missing/failed smi must not re-spawn per poll either."""
+    """A rejected combined query tries the name probe once, then the miss is cached.
+
+    Name-only is the robustness floor for "no device" versus "this field set is
+    unsupported". When that misses too, the next reader within the TTL must not
+    spawn again — and must not go on to the memory probe, which cannot succeed
+    if the name probe found nothing.
+    """
     from hermes_cli.local_runtime import hardware
 
     captured = []
@@ -618,5 +624,16 @@ def test_cached_nvidia_gpu_query_failure_is_cached(monkeypatch):
     monkeypatch.setattr(hardware.subprocess, "run", fake_run)
 
     assert hardware._nvidia_vram() is None
+    fields = [
+        arg.split("=", 1)[1]
+        for cmd, _kwargs in _spawns(captured, "nvidia-smi")
+        for arg in cmd
+        if arg.startswith("--query-gpu=")
+    ]
+    assert fields == [
+        "memory.total,memory.free,name,pci.device_id,memory.used,utilization.gpu",
+        "name",
+    ]
+    spawned = len(_spawns(captured, "nvidia-smi"))
     assert hardware._cached_nvidia_gpu_query() is None  # TTL hit, no second spawn
-    assert len(captured) == 1, captured
+    assert len(_spawns(captured, "nvidia-smi")) == spawned

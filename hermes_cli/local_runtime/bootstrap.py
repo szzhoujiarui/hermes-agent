@@ -43,6 +43,9 @@ def _detect_gpu_vendor() -> str | None:
 
     Preserve NVIDIA's detailed name when nvidia-smi is available, then use the
     platform host facts so Intel and AMD do not silently demote ``auto`` to CPU.
+    The shared query falls back to the historical name-only ``nvidia-smi`` probe
+    when the combined field set is rejected or omits the name, so a driver that
+    cannot answer utilization or PCI id still selects CUDA.
     """
     from hermes_cli.local_runtime.hardware import _cached_nvidia_gpu_query
     from hermes_platform.host.facts import gpu_class

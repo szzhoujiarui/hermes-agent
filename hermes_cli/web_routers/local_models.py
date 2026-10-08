@@ -529,15 +529,19 @@ def _nvidia_smi_facts() -> dict:
     """GPU identity + live utilization (NVIDIA only; other vendors degrade to {} and the UI hides those readouts).
 
     Reads the shared cached query: one nvidia-smi spawn per poll window, hidden on Windows,
-    instead of a second bare one per request (#101895, #120262)."""
+    instead of a second bare one per request (#101895, #120262). A cell the driver answers
+    with ``N/A`` is omitted, not reported as zero — zero is a real idle/empty reading, and
+    the statusbar uses a missing name to show RAM instead of "GPU 0%".
+    """
     query = hardware._cached_nvidia_gpu_query()
-    if query is None:
+    if not query or not query.get("gpu_name"):
         return {}
-    return dict(
-        gpu_name=query["gpu_name"],
-        gpu_util_percent=query["gpu_util_percent"],
-        vram_used_bytes=query["used_bytes"],
-    )
+    facts = {"gpu_name": query["gpu_name"]}
+    if query.get("gpu_util_percent") is not None:
+        facts["gpu_util_percent"] = query["gpu_util_percent"]
+    if query.get("used_bytes") is not None:
+        facts["vram_used_bytes"] = query["used_bytes"]
+    return facts
 
 
 @router.get("/api/local-models/hardware")

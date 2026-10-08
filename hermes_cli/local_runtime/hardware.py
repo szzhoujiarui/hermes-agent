@@ -202,11 +202,20 @@ def _nvidia_smi_path() -> str | None:
 
 
 def _nvidia_vram() -> tuple[int, int, str, int | None] | None:
-    """(total bytes, free bytes, name, optional packed PCI ID) from the shared nvidia-smi query, or None."""
+    """(total bytes, free bytes, name, optional packed PCI ID) from the shared nvidia-smi query, or None.
+
+    Free memory is optional. A driver that reports capacity and ``N/A`` for free must not look
+    like "no card" — that budgets a discrete GPU from system RAM. Unknown free uses capacity,
+    which is the figure the driver did give.
+    """
     query = _cached_nvidia_gpu_query()
-    if query is None:
+    if query is None or query.get("total_bytes") is None:
         return None
-    return query["total_bytes"], query["free_bytes"], query["gpu_name"], query.get("gpu_pci_id")
+    total = query["total_bytes"]
+    free = query.get("free_bytes")
+    if free is None:
+        free = total
+    return total, free, query.get("gpu_name") or "", query.get("gpu_pci_id")
 
 
 _gpu_query_cache: "tuple[float, dict | None] | None" = None
@@ -217,13 +226,157 @@ _gpu_query_cache: "tuple[float, dict | None] | None" = None
 # never flashes a window (#101895).
 _GPU_QUERY_TTL_S = 4.0
 
+# Wide query first. ``pci.device_id`` / ``utilization.gpu`` are the fields older
+# drivers reject for the whole process (rc≠0, empty stdout) or answer with N/A.
+# Name-only and memory-only are the probes backend selection and VRAM budgeting
+# used before the fields were merged; they still have to work on their own.
+_WIDE_GPU_QUERY = "memory.total,memory.free,name,pci.device_id,memory.used,utilization.gpu"
+_NAME_GPU_QUERY = "name"
+_MEMORY_GPU_QUERY = "memory.total,memory.free"
+
+# nvidia-smi prints these instead of a number when a field exists but this driver
+# will not answer it. They are not zero.
+_SMI_UNAVAILABLE = frozenset({
+    "n/a",
+    "[n/a]",
+    "[not supported]",
+    "[insufficient permissions]",
+    "[unknown error]",
+})
+
+
+def _smi_int(token: str, *, base: int = 10) -> int | None:
+    """Parse one nvidia-smi cell. Unavailable / non-numeric cells are None, not an error."""
+    text = token.strip()
+    if not text or text.lower() in _SMI_UNAVAILABLE:
+        return None
+    try:
+        return int(text, base)
+    except ValueError:
+        return None
+
+
+def _mib_to_bytes(token: str) -> int | None:
+    mib = _smi_int(token)
+    if mib is None:
+        return None
+    return mib << 20
+
+
+def _blank_gpu_query() -> dict:
+    return {
+        "gpu_name": "",
+        "total_bytes": None,
+        "free_bytes": None,
+        "used_bytes": None,
+        "gpu_util_percent": None,
+        "gpu_pci_id": None,
+    }
+
+
+def _gpu_query_has_reading(data: dict) -> bool:
+    if data.get("gpu_name"):
+        return True
+    return any(data.get(key) is not None for key in (
+        "total_bytes", "free_bytes", "used_bytes", "gpu_util_percent", "gpu_pci_id"))
+
+
+def _csv_row(stdout: str) -> list[str]:
+    return next(csv.reader(stdout.strip().splitlines(), skipinitialspace=True), [])
+
+
+def _gpu_name_from_smi_stdout(stdout: str) -> str:
+    """Name-only nvidia-smi line. The whole line is the name, including commas."""
+    line = stdout.strip().splitlines()[0].strip()
+    if len(line) >= 2 and line.startswith('"') and line.endswith('"'):
+        line = line[1:-1].replace('""', '"')
+    if not line or line.lower() in _SMI_UNAVAILABLE:
+        return ""
+    return line
+
+
+def _parse_wide_gpu_csv(stdout: str) -> dict:
+    """Parse the shared 6-field row. Each cell stands alone — ``N/A`` drops that cell only."""
+    row = _csv_row(stdout)
+    if len(row) < 6:
+        row = row + [""] * (6 - len(row))
+    total_mib, free_mib, name, raw_id, used_mib, util = row[:6]
+    name = name.strip()
+    if name.lower() in _SMI_UNAVAILABLE:
+        name = ""
+    return {
+        "gpu_name": name,
+        "total_bytes": _mib_to_bytes(total_mib),
+        "free_bytes": _mib_to_bytes(free_mib),
+        "used_bytes": _mib_to_bytes(used_mib),
+        "gpu_util_percent": _smi_int(util),
+        "gpu_pci_id": _smi_int(raw_id, base=16),
+    }
+
+
+def _parse_memory_csv(stdout: str) -> tuple[int | None, int | None]:
+    row = _csv_row(stdout)
+    if len(row) < 2:
+        row = row + [""] * (2 - len(row))
+    return _mib_to_bytes(row[0]), _mib_to_bytes(row[1])
+
+
+def _nvidia_smi_csv(exe: str, fields: str, *, nounits: bool, creationflags: int) -> str | None:
+    """stdout of one nvidia-smi query, or None when that field set is rejected."""
+    fmt = "csv,noheader,nounits" if nounits else "csv,noheader"
+    out = subprocess.run(
+        [exe, f"--query-gpu={fields}", f"--format={fmt}"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
+        creationflags=creationflags)
+    if out.returncode != 0 or not (out.stdout or "").strip():
+        return None
+    return out.stdout
+
+
+def _read_nvidia_gpu_query(exe: str, creationflags: int) -> dict | None:
+    """Wide query, then the historical name-only and memory-only probes for whatever it missed.
+
+    A timeout aborts the rest: another 10s probe would stall install/launch. A fast rejection
+    (unknown field, rc≠0) still falls through. When the name probe misses too, stop — a
+    memory-only probe will not find a device the name probe could not.
+    """
+    data = _blank_gpu_query()
+    try:
+        wide = _nvidia_smi_csv(exe, _WIDE_GPU_QUERY, nounits=True, creationflags=creationflags)
+        if wide:
+            data = _parse_wide_gpu_csv(wide)
+        if not data["gpu_name"]:
+            name_out = _nvidia_smi_csv(exe, _NAME_GPU_QUERY, nounits=False, creationflags=creationflags)
+            if name_out:
+                data["gpu_name"] = _gpu_name_from_smi_stdout(name_out)
+        if not wide and not data["gpu_name"]:
+            return None
+        if data["total_bytes"] is None or data["free_bytes"] is None:
+            mem = _nvidia_smi_csv(exe, _MEMORY_GPU_QUERY, nounits=True, creationflags=creationflags)
+            if mem:
+                total, free = _parse_memory_csv(mem)
+                if data["total_bytes"] is None:
+                    data["total_bytes"] = total
+                if data["free_bytes"] is None:
+                    data["free_bytes"] = free
+    except (OSError, subprocess.TimeoutExpired):
+        if not _gpu_query_has_reading(data):
+            return None
+    if not _gpu_query_has_reading(data):
+        return None
+    return data
+
 
 def _cached_nvidia_gpu_query(ttl_s: float = _GPU_QUERY_TTL_S) -> "dict | None":
-    """One nvidia-smi read shared by the budget probe and the hardware endpoint.
+    """One nvidia-smi read shared by the budget probe, vendor detection, and the hardware endpoint.
 
     Returns ``dict(gpu_name=, total_bytes=, free_bytes=, used_bytes=, gpu_util_percent=,
-    gpu_pci_id=)`` or None when nvidia-smi is absent, fails, or is not an NVIDIA card.
-    Cached for ``ttl_s`` (failures too — a missing smi must not spawn per poll).
+    gpu_pci_id=)``. Numeric cells the driver answers with ``N/A`` are None; the other cells
+    are still returned. None only when nvidia-smi is absent or the name probe misses too.
+
+    A partial reading is what gets cached. Caching the wide query's failure as None made
+    every other reader miss a name-only / memory-only answer for the whole TTL. A true miss
+    (no binary, or the name probe failed) is cached so a missing device does not spawn per poll.
     """
     global _gpu_query_cache
     now = time.monotonic()
@@ -236,32 +389,10 @@ def _cached_nvidia_gpu_query(ttl_s: float = _GPU_QUERY_TTL_S) -> "dict | None":
         return None
 
     from hermes_cli._subprocess_compat import windows_hide_flags
-    with suppress(OSError, ValueError, subprocess.TimeoutExpired):
-        out = subprocess.run(
-            [exe, "--query-gpu=memory.total,memory.free,name,pci.device_id,memory.used,utilization.gpu",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
-            creationflags=windows_hide_flags())
-        if out.returncode != 0 or not out.stdout.strip():
-            _gpu_query_cache = (now, None)
-            return None
-        total_mib, free_mib, name, raw_id, used_mib, util = next(
-            csv.reader(out.stdout.strip().splitlines(), skipinitialspace=True))
-        pci_id = None
-        with suppress(ValueError):  # N/A or unsupported identity must not lose memory data.
-            pci_id = int(raw_id, 16)
-        data = {
-            "gpu_name": name.strip(),
-            "total_bytes": int(total_mib) << 20,
-            "free_bytes": int(free_mib) << 20,
-            "used_bytes": int(used_mib) << 20,
-            "gpu_util_percent": int(util),
-            "gpu_pci_id": pci_id,
-        }
-        _gpu_query_cache = (now, data)
-        return data
-    _gpu_query_cache = (now, None)
-    return None
+
+    data = _read_nvidia_gpu_query(exe, windows_hide_flags())
+    _gpu_query_cache = (now, data)
+    return data
 
 
 def _cuda_driver_pool() -> "tuple[int, bool | None] | None":
